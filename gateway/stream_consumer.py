@@ -43,6 +43,7 @@ class StreamConsumerConfig:
     edit_interval: float = 1.0
     buffer_threshold: int = 40
     cursor: str = " ▉"
+    show_reasoning: bool = False
 
 
 class GatewayStreamConsumer:
@@ -287,9 +288,21 @@ class GatewayStreamConsumer:
     # Matches the simple cleanup regex used by the non-streaming path in
     # gateway/platforms/base.py for post-processing.
     _MEDIA_RE = re.compile(r'''[`"']?MEDIA:\s*\S+[`"']?''')
+    _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
+    _OPEN_THINK_TAIL_RE = re.compile(r"<think\b[^>]*>.*$", re.IGNORECASE | re.DOTALL)
+    _CLOSE_THINK_RE = re.compile(r"</think>", re.IGNORECASE)
+
+    @classmethod
+    def _strip_hidden_reasoning(cls, text: str) -> str:
+        """Remove inline <think> blocks from user-visible output."""
+        if "<think" not in text.lower() and "</think>" not in text.lower():
+            return text
+        cleaned = cls._THINK_BLOCK_RE.sub("", text)
+        cleaned = cls._OPEN_THINK_TAIL_RE.sub("", cleaned)
+        return cls._CLOSE_THINK_RE.sub("", cleaned).strip()
 
     @staticmethod
-    def _clean_for_display(text: str) -> str:
+    def _clean_for_display(text: str, show_reasoning: bool = False) -> str:
         """Strip MEDIA: directives and internal markers from text before display.
 
         The streaming path delivers raw text chunks that may include
@@ -299,9 +312,14 @@ class GatewayStreamConsumer:
         stream finishes — we just need to hide the raw directives from the
         user.
         """
-        if "MEDIA:" not in text and "[[audio_as_voice]]" not in text:
+        if (
+            "MEDIA:" not in text
+            and "[[audio_as_voice]]" not in text
+            and (show_reasoning or ("<think" not in text.lower() and "</think>" not in text.lower()))
+        ):
             return text
-        cleaned = text.replace("[[audio_as_voice]]", "")
+        cleaned = text if show_reasoning else GatewayStreamConsumer._strip_hidden_reasoning(text)
+        cleaned = cleaned.replace("[[audio_as_voice]]", "")
         cleaned = GatewayStreamConsumer._MEDIA_RE.sub("", cleaned)
         # Collapse excessive blank lines left behind by removed tags
         cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
@@ -313,7 +331,7 @@ class GatewayStreamConsumer:
 
         Returns the message_id so callers can thread subsequent chunks.
         """
-        text = self._clean_for_display(text)
+        text = self._clean_for_display(text, self.cfg.show_reasoning)
         if not text.strip():
             return reply_to_id
         try:
@@ -341,7 +359,7 @@ class GatewayStreamConsumer:
         prefix = self._last_sent_text or ""
         if self.cfg.cursor and prefix.endswith(self.cfg.cursor):
             prefix = prefix[:-len(self.cfg.cursor)]
-        return self._clean_for_display(prefix)
+        return self._clean_for_display(prefix, self.cfg.show_reasoning)
 
     def _continuation_text(self, final_text: str) -> str:
         """Return only the part of final_text the user has not already seen."""
@@ -372,7 +390,7 @@ class GatewayStreamConsumer:
 
         Retries each chunk once on flood-control failures with a short delay.
         """
-        final_text = self._clean_for_display(text)
+        final_text = self._clean_for_display(text, self.cfg.show_reasoning)
         continuation = self._continuation_text(final_text)
         self._fallback_final_send = False
         if not continuation.strip():
@@ -464,7 +482,7 @@ class GatewayStreamConsumer:
 
     async def _send_commentary(self, text: str) -> bool:
         """Send a completed interim assistant commentary message."""
-        text = self._clean_for_display(text)
+        text = self._clean_for_display(text, self.cfg.show_reasoning)
         if not text.strip():
             return False
         try:
@@ -490,7 +508,7 @@ class GatewayStreamConsumer:
         # Strip MEDIA: directives so they don't appear as visible text.
         # Media files are delivered as native attachments after the stream
         # finishes (via _deliver_media_from_response in gateway/run.py).
-        text = self._clean_for_display(text)
+        text = self._clean_for_display(text, self.cfg.show_reasoning)
         if not text.strip():
             return True  # nothing to send is "success"
         try:

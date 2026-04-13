@@ -530,6 +530,9 @@ class GatewayRunner:
     _restart_via_service: bool = False
     _stop_task: Optional[asyncio.Task] = None
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
+    _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
+    _OPEN_THINK_TAIL_RE = re.compile(r"<think\b[^>]*>.*$", re.IGNORECASE | re.DOTALL)
+    _CLOSE_THINK_RE = re.compile(r"</think>", re.IGNORECASE)
     
     def __init__(self, config: Optional[GatewayConfig] = None):
         self.config = config or load_gateway_config()
@@ -1188,6 +1191,41 @@ class GatewayRunner:
         except Exception:
             pass
         return False
+
+    def _show_reasoning_for_source(self, source) -> bool:
+        """Resolve the effective reasoning display toggle for a platform source."""
+        try:
+            from gateway.display_config import resolve_display_setting as _rds
+            return bool(_rds(
+                _load_gateway_config(),
+                _platform_config_key(source.platform),
+                "show_reasoning",
+                getattr(self, "_show_reasoning", False),
+            ))
+        except Exception:
+            return bool(getattr(self, "_show_reasoning", False))
+
+    @classmethod
+    def _response_contains_think_tags(cls, text: str) -> bool:
+        return "<think" in text.lower() or "</think>" in text.lower()
+
+    @classmethod
+    def _strip_hidden_reasoning(cls, text: str) -> str:
+        """Remove inline <think> blocks from displayed text."""
+        if not cls._response_contains_think_tags(text):
+            return text
+        cleaned = cls._THINK_BLOCK_RE.sub("", text)
+        cleaned = cls._OPEN_THINK_TAIL_RE.sub("", cleaned)
+        cleaned = cls._CLOSE_THINK_RE.sub("", cleaned)
+        return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+    def _prepare_display_response(self, text: str, source) -> str:
+        """Prepare a response for messaging output based on display settings."""
+        if not text:
+            return text
+        if self._show_reasoning_for_source(source):
+            return text
+        return self._strip_hidden_reasoning(text)
 
     @staticmethod
     def _load_busy_input_mode() -> str:
@@ -3614,17 +3652,12 @@ class GatewayRunner:
                 session_entry.session_id = agent_result["session_id"]
 
             # Prepend reasoning/thinking if display is enabled (per-platform)
-            try:
-                from gateway.display_config import resolve_display_setting as _rds
-                _show_reasoning_effective = _rds(
-                    _load_gateway_config(),
-                    _platform_config_key(source.platform),
-                    "show_reasoning",
-                    getattr(self, "_show_reasoning", False),
-                )
-            except Exception:
-                _show_reasoning_effective = getattr(self, "_show_reasoning", False)
-            if _show_reasoning_effective and response:
+            _show_reasoning_effective = self._show_reasoning_for_source(source)
+            if (
+                _show_reasoning_effective
+                and response
+                and not self._response_contains_think_tags(response)
+            ):
                 last_reasoning = agent_result.get("last_reasoning")
                 if last_reasoning:
                     # Collapse long reasoning to keep messages readable
@@ -3635,6 +3668,7 @@ class GatewayRunner:
                     else:
                         display_reasoning = last_reasoning.strip()
                     response = f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
+            response = self._prepare_display_response(response, source)
 
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {
@@ -5382,6 +5416,7 @@ class GatewayRunner:
             response = result.get("final_response", "") if result else ""
             if not response and result and result.get("error"):
                 response = f"Error: {result['error']}"
+            response = self._prepare_display_response(response, source)
 
             # Extract media files from the response
             if response:
@@ -5567,6 +5602,8 @@ class GatewayRunner:
                 response = f"Error: {result['error']}"
             if not response:
                 response = "(No response generated)"
+            else:
+                response = self._prepare_display_response(response, source)
 
             media_files, response = adapter.extract_media(response)
             images, text_content = adapter.extract_images(response)
@@ -7818,6 +7855,7 @@ class GatewayRunner:
                             edit_interval=_scfg.edit_interval,
                             buffer_threshold=_scfg.buffer_threshold,
                             cursor=_effective_cursor,
+                            show_reasoning=self._show_reasoning_for_source(source),
                         )
                         _stream_consumer = GatewayStreamConsumer(
                             adapter=_adapter,
